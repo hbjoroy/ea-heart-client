@@ -1,0 +1,23 @@
+[package]
+name = "heart-client"
+version = "0.1.0"
+edition = "2021"
+description = "HTTP client for the Heart process engine API"
+license = "MIT"
+repository = "https://github.com/SparebankenVest/ea-heart-client"
+
+[features]
+default = ["rustls"]
+rustls = ["reqwest/rustls-tls"]
+native-tls = ["reqwest/native-tls"]
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+uuid = { version = "1", features = ["serde"] }
+thiserror = "2"
+async-trait = "0.1"
+anyhow = "1"
+tokio = { version = "1", features = ["time"] }
