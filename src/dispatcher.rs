@@ -24,11 +24,7 @@ pub trait WorkHandler: Send + Sync {
     fn queue(&self) -> &str;
 
     /// Process a work item. Return Complete to advance the process, Hold to wait.
-    async fn handle(
-        &self,
-        item: &WorkItem,
-        ctx: &WorkContext,
-    ) -> anyhow::Result<HandlerResult>;
+    async fn handle(&self, item: &WorkItem, ctx: &WorkContext) -> anyhow::Result<HandlerResult>;
 }
 
 /// Shared context passed to all work handlers.
@@ -86,8 +82,7 @@ impl WorkDispatcher {
             if found_work {
                 current_interval_ms = POLL_MIN_MS;
             } else {
-                current_interval_ms =
-                    ((current_interval_ms as f64) * POLL_BACKOFF_FACTOR) as u64;
+                current_interval_ms = ((current_interval_ms as f64) * POLL_BACKOFF_FACTOR) as u64;
                 if current_interval_ms > POLL_MAX_MS {
                     current_interval_ms = POLL_MAX_MS;
                 }
@@ -108,10 +103,7 @@ impl WorkDispatcher {
 
         match handler.handle(&item, &self.ctx).await? {
             HandlerResult::Complete(metadata) => {
-                self.ctx
-                    .heart
-                    .complete_work_item(item.id, metadata)
-                    .await?;
+                self.ctx.heart.complete_work_item(item.id, metadata).await?;
                 debug!(queue = handler.queue(), item_id = %item.id, "completed work item");
             }
             HandlerResult::Hold => {

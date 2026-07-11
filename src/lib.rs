@@ -34,6 +34,22 @@ pub struct StartInstanceResponse {
     pub run: Option<RunResult>,
 }
 
+/// Response from correlating a message to Heart receive nodes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendMessageResponse {
+    pub matched_instances: usize,
+    pub instance_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub runs: Vec<MessageRun>,
+}
+
+/// Run result for one instance matched by a receive message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageRun {
+    pub instance_id: Uuid,
+    pub run: RunResult,
+}
+
 /// Result of stepping an instance (returned inside start response).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunResult {
@@ -138,8 +154,7 @@ impl HeartClient {
     /// Returns `None` if `HEART_API_URL` is not set.
     pub fn from_env() -> Option<Self> {
         let base_url = std::env::var("HEART_API_URL").ok()?;
-        let namespace =
-            std::env::var("HEART_NAMESPACE").unwrap_or_else(|_| "default".to_string());
+        let namespace = std::env::var("HEART_NAMESPACE").unwrap_or_else(|_| "default".to_string());
         Some(Self::new(base_url, namespace))
     }
 
@@ -199,25 +214,73 @@ impl HeartClient {
             .await?;
 
         let value = self.handle_response(resp).await?;
-        Ok(serde_json::from_value(value).map_err(|e| HeartError::Api {
+        serde_json::from_value(value).map_err(|e| HeartError::Api {
             status: 0,
             message: format!("failed to parse start response: {}", e),
-        })?)
+        })
     }
 
     /// Get instance details.
     pub async fn get_instance(&self, instance_id: Uuid) -> Result<InstanceDetails, HeartError> {
         let resp = self
             .http
-            .get(format!("{}/api/v1/instances/{}", self.base_url, instance_id))
+            .get(format!(
+                "{}/api/v1/instances/{}",
+                self.base_url, instance_id
+            ))
             .send()
             .await?;
 
         let value = self.handle_response(resp).await?;
-        Ok(serde_json::from_value(value).map_err(|e| HeartError::Api {
+        serde_json::from_value(value).map_err(|e| HeartError::Api {
             status: 0,
             message: format!("failed to parse instance: {}", e),
-        })?)
+        })
+    }
+
+    /// Correlate a message to receive nodes in the default namespace.
+    pub async fn send_message(
+        &self,
+        correlation_key: &str,
+        correlation_value: &str,
+        payload: Value,
+    ) -> Result<SendMessageResponse, HeartError> {
+        self.send_message_in_namespace(&self.namespace, correlation_key, correlation_value, payload)
+            .await
+    }
+
+    /// Correlate a message to receive nodes in a specific namespace.
+    pub async fn send_message_in_namespace(
+        &self,
+        namespace: &str,
+        correlation_key: &str,
+        correlation_value: &str,
+        payload: Value,
+    ) -> Result<SendMessageResponse, HeartError> {
+        let body = serde_json::json!({
+            "namespace": namespace,
+            "correlation_key": correlation_key,
+            "correlation_value": correlation_value,
+            "payload": payload,
+        });
+
+        debug!(
+            namespace = %namespace,
+            correlation_key = %correlation_key,
+            "sending correlated Heart message"
+        );
+
+        let response = self
+            .http
+            .post(format!("{}/api/v1/messages", self.base_url))
+            .json(&body)
+            .send()
+            .await?;
+        let value = self.handle_response(response).await?;
+        serde_json::from_value(value).map_err(|error| HeartError::Api {
+            status: 0,
+            message: format!("failed to parse send-message response: {error}"),
+        })
     }
 
     /// Pick next pending work item from a queue.
@@ -327,11 +390,7 @@ impl HeartClient {
     }
 
     /// Get a specific definition version (includes parsed nodes).
-    pub async fn get_definition(
-        &self,
-        name: &str,
-        version: &str,
-    ) -> Result<Value, HeartError> {
+    pub async fn get_definition(&self, name: &str, version: &str) -> Result<Value, HeartError> {
         self.get_definition_in_namespace(&self.namespace, name, version)
             .await
     }
@@ -390,10 +449,7 @@ impl HeartClient {
     }
 
     /// List work items in a specific queue.
-    pub async fn list_queue_items(
-        &self,
-        queue_name: &str,
-    ) -> Result<Vec<WorkItem>, HeartError> {
+    pub async fn list_queue_items(&self, queue_name: &str) -> Result<Vec<WorkItem>, HeartError> {
         let resp = self
             .http
             .get(format!(
@@ -463,7 +519,12 @@ impl HeartClient {
 
     /// Check if Heart is reachable.
     pub async fn health_check(&self) -> bool {
-        match self.http.get(format!("{}/health", self.base_url)).send().await {
+        match self
+            .http
+            .get(format!("{}/health", self.base_url))
+            .send()
+            .await
+        {
             Ok(resp) => resp.status().is_success(),
             Err(e) => {
                 warn!("Heart health check failed: {}", e);
