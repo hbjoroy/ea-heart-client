@@ -536,10 +536,175 @@ impl HeartClient {
     async fn handle_response(&self, resp: reqwest::Response) -> Result<Value, HeartError> {
         let status = resp.status().as_u16();
         if status >= 400 {
-            let message = resp.text().await.unwrap_or_default();
-            return Err(HeartError::Api { status, message });
+            return Err(HeartError::Api {
+                status,
+                message: "Heart API request failed".to_string(),
+            });
         }
         let value = resp.json().await?;
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::oneshot,
+    };
+
+    #[derive(Debug)]
+    struct CapturedRequest {
+        request_line: String,
+        body: Value,
+    }
+
+    async fn mock_response(
+        status: u16,
+        response_body: Value,
+    ) -> (String, oneshot::Receiver<CapturedRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let header_end;
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "connection closed before request headers");
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(position) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    header_end = position + 4;
+                    break;
+                }
+            }
+            let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            while request.len() - header_end < content_length {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "connection closed before request body");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = serde_json::from_slice(&request[header_end..header_end + content_length])
+                .unwrap_or(Value::Null);
+            sender
+                .send(CapturedRequest {
+                    request_line: headers.lines().next().unwrap().to_string(),
+                    body,
+                })
+                .unwrap();
+
+            let body = serde_json::to_vec(&response_body).unwrap();
+            let reason = if status == 200 {
+                "OK"
+            } else {
+                "Internal Server Error"
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+        (format!("http://{address}"), receiver)
+    }
+
+    fn successful_response(instance_id: Uuid) -> Value {
+        serde_json::json!({
+            "matched_instances": 1,
+            "instance_ids": [instance_id],
+            "runs": [{
+                "instance_id": instance_id,
+                "run": {
+                    "outcome": {"result":"waiting","node_id":"review","work_item_id":null,"queue_name":null},
+                    "steps": ["receive", "review"],
+                    "step_count": 2
+                }
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn send_message_uses_default_namespace_and_decodes_runs() {
+        let instance_id = Uuid::from_u128(0x11111111111141118111111111111111);
+        let (base_url, captured) = mock_response(200, successful_response(instance_id)).await;
+        let client = HeartClient::new(base_url, "friends".to_string());
+
+        let response = client
+            .send_message("event_id", "event-42", serde_json::json!({"answer":"yes"}))
+            .await
+            .unwrap();
+
+        let request = captured.await.unwrap();
+        assert_eq!(request.request_line, "POST /api/v1/messages HTTP/1.1");
+        assert_eq!(
+            request.body,
+            serde_json::json!({
+                "namespace":"friends",
+                "correlation_key":"event_id",
+                "correlation_value":"event-42",
+                "payload":{"answer":"yes"}
+            })
+        );
+        assert_eq!(response.matched_instances, 1);
+        assert_eq!(response.instance_ids, vec![instance_id]);
+        assert_eq!(response.runs.len(), 1);
+        assert_eq!(response.runs[0].instance_id, instance_id);
+        assert_eq!(response.runs[0].run.step_count, 2);
+    }
+
+    #[tokio::test]
+    async fn send_message_supports_explicit_namespace() {
+        let instance_id = Uuid::from_u128(0x22222222222242228222222222222222);
+        let (base_url, captured) = mock_response(200, successful_response(instance_id)).await;
+        let client = HeartClient::new(base_url, "default".to_string());
+
+        client
+            .send_message_in_namespace(
+                "circle-a",
+                "decision_id",
+                "decision-7",
+                serde_json::json!({"choice":"approve"}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(captured.await.unwrap().body["namespace"], "circle-a");
+    }
+
+    #[tokio::test]
+    async fn api_errors_preserve_status_without_exposing_response_body() {
+        let (base_url, _captured) = mock_response(
+            500,
+            serde_json::json!({"error":"failed","token":"super-secret"}),
+        )
+        .await;
+        let client = HeartClient::new(base_url, "default".to_string());
+
+        let error = client
+            .send_message("key", "value", Value::Null)
+            .await
+            .unwrap_err();
+
+        match &error {
+            HeartError::Api { status, message } => {
+                assert_eq!(*status, 500);
+                assert_eq!(message, "Heart API request failed");
+            }
+            other => panic!("expected API error, got {other:?}"),
+        }
+        assert!(!error.to_string().contains("super-secret"));
     }
 }

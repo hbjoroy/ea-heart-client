@@ -5,6 +5,7 @@ Standalone Rust client library for the [Heart process engine](https://github.com
 ## Features
 
 - **HeartClient** — Typed HTTP client for Heart API (definitions, instances, queues, work items)
+- **Receive-message API** — Correlate typed payloads through `POST /api/v1/messages`
 - **WorkDispatcher** — Generic adaptive-polling work dispatcher
 - **WorkHandler** trait — Implement per-queue handlers for your application
 
@@ -47,3 +48,20 @@ async fn main() {
 
 - `HEART_API_URL` — Heart API base URL (e.g., `http://heart:3000`)
 - `HEART_NAMESPACE` — Default namespace (default: `"default"`)
+
+## Receive-message contract
+
+Use `send_message` for the configured default namespace or
+`send_message_in_namespace` for an explicit namespace. Both return
+`SendMessageResponse`, including matched instance IDs and any per-instance run
+results. Non-success responses retain the HTTP status but deliberately discard
+the provider response body so tokens and process payloads cannot leak through
+client errors.
+
+Run the pinned quality gate locally with:
+
+```bash
+cargo fmt --all --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
+```
