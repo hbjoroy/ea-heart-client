@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "HTTP client for the Heart process engine API"
 license = "MIT"
-repository = "https://github.com/SparebankenVest/ea-heart-client"
+repository = "https://github.com/hbjoroy/ea-heart-client"
 
 [features]
 default = ["rustls"]

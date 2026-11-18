@@ -1,6 +1,6 @@
 # ea-heart-client
 
-Standalone Rust client library for the [Heart process engine](https://github.com/SparebankenVest/ea-bank-core) REST API.
+Standalone Rust client library for the [Heart process engine](https://github.com/hbjoroy/heart) REST API.
 
 ## Features
 
@@ -13,7 +13,7 @@ Standalone Rust client library for the [Heart process engine](https://github.com
 
 ```toml
 [dependencies]
-heart-client = { git = "https://github.com/SparebankenVest/ea-heart-client", tag = "v0.1.0" }
+heart-client = { git = "https://github.com/hbjoroy/ea-heart-client", tag = "v0.1.0" }
 ```
 
 ```rust
