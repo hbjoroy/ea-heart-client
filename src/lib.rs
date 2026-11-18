@@ -7,6 +7,7 @@
 //! building workers that poll Heart queues.
 
 pub mod dispatcher;
+pub mod v2;
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
