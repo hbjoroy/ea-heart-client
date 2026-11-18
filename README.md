@@ -75,6 +75,13 @@ service bearer token. A literal loopback address can also use HTTP for local
 testing or a colocated TLS proxy. `rustls` is enabled by default. To use the
 platform TLS implementation, disable default features and enable `native-tls`.
 
+Use `ExternalJobsClient::with_ca_bundle` for a Heart endpoint signed by a
+private CA. Pass the HTTPS service URL whose DNS name or IP appears in the
+server certificate, plus the PEM CA certificates the client should trust.
+Both TLS backends verify the certificate and endpoint identity. A custom
+bundle supplies the client's trusted roots. It can contain both roots during
+a CA rotation.
+
 ```rust
 use heart_client::v2::{
     ClaimScope, DispatchConfig, ExternalDispatcher, ExternalHandler, ExternalJobsClient,
@@ -152,6 +159,8 @@ with external jobs enabled. Configure `HEART_API_URL`, `HEART_WORKER_TOKEN`,
 `HEART_WORKER_NAMESPACE` and `HEART_PILOT_EFFECT_DIR`. The pilot defaults to task
 type `account-check`, version 1 and capacity 1. Override its task type or
 capacity with `HEART_WORKER_TASK_TYPE` or `HEART_PILOT_CAPACITY`.
+Set `HEART_WORKER_CA_FILE` to the PEM bundle path if the service uses a private
+CA.
 
 Replicas share the same effect directory on a filesystem that supports hard
 links. An attempt publishes one `<job_id>.json` per job and recovers the same

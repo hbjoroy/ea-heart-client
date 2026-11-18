@@ -13,12 +13,13 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::TcpListener,
     sync::{mpsc, oneshot, Semaphore},
     task::{JoinHandle, JoinSet},
     time::timeout,
 };
+use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
 const BEARER: &str = "fixture_service_token_0123456789";
@@ -74,8 +75,13 @@ struct Server {
 
 impl Server {
     async fn start() -> Self {
+        Self::listen(None).await
+    }
+
+    async fn listen(tls: Option<TlsAcceptor>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = format!("http://{}", listener.local_addr().unwrap());
+        let scheme = if tls.is_some() { "https" } else { "http" };
+        let address = format!("{scheme}://{}", listener.local_addr().unwrap());
         let (sender, requests) = mpsc::channel(16);
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
@@ -83,7 +89,16 @@ impl Server {
                 tokio::select! {
                     result = listener.accept() => {
                         let (stream, _) = result.unwrap();
-                        connections.spawn(serve_request(stream, sender.clone()));
+                        let (sender, tls) = (sender.clone(), tls.clone());
+                        connections.spawn(async move {
+                            if let Some(acceptor) = tls {
+                                if let Ok(stream) = acceptor.accept(stream).await {
+                                    serve_request(stream, sender).await;
+                                }
+                            } else {
+                                serve_request(stream, sender).await;
+                            }
+                        });
                     }
                     result = connections.join_next(), if !connections.is_empty() => {
                         result.unwrap().unwrap();
@@ -119,11 +134,16 @@ impl Drop for Server {
     }
 }
 
-async fn serve_request(mut stream: TcpStream, requests: mpsc::Sender<Request>) {
+async fn serve_request(
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
+    requests: mpsc::Sender<Request>,
+) {
     let mut raw = Vec::new();
     let mut buf = [0; 4096];
     let header_end = loop {
-        let count = stream.read(&mut buf).await.unwrap();
+        let Ok(count) = stream.read(&mut buf).await else {
+            return;
+        };
         if count == 0 {
             return;
         }
@@ -141,7 +161,9 @@ async fn serve_request(mut stream: TcpStream, requests: mpsc::Sender<Request>) {
         .collect();
     let body_end = header_end + headers["content-length"].parse::<usize>().unwrap();
     while raw.len() < body_end {
-        let count = stream.read(&mut buf).await.unwrap();
+        let Ok(count) = stream.read(&mut buf).await else {
+            return;
+        };
         if count == 0 {
             return;
         }
@@ -356,6 +378,81 @@ async fn redirects_are_rejected_without_replaying_a_claim() {
         WorkerError::Rejected { status: 307, .. }
     ));
     server.quiet_for(Duration::from_millis(50)).await;
+}
+
+#[cfg(any(feature = "rustls", feature = "native-tls"))]
+#[tokio::test]
+async fn https_private_ca_requires_a_trusted_root_and_the_correct_endpoint_identity() {
+    use rcgen::{
+        BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
+        KeyPair, KeyUsagePurpose,
+    };
+    use tokio_rustls::rustls::{self, pki_types::PrivatePkcs8KeyDer, ServerConfig};
+
+    fn authority(name: &str) -> (Certificate, KeyPair) {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name.push(DnType::CommonName, name);
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca = params.self_signed(&key).unwrap();
+        (ca, key)
+    }
+
+    fn acceptor(dns_or_ip: &str, ca: &Certificate, ca_key: &KeyPair) -> TlsAcceptor {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec![dns_or_ip.to_owned()]).unwrap();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, dns_or_ip);
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let leaf = params.signed_by(&key, ca, ca_key).unwrap();
+        let server =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![leaf.der().clone()],
+                    PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+                )
+                .unwrap();
+        Arc::new(server).into()
+    }
+
+    let (ca, ca_key) = authority("Heart SDK test root");
+    let (unrelated, _) = authority("Heart SDK unrelated root");
+    let mut server = Server::listen(Some(acceptor("127.0.0.1", &ca, &ca_key))).await;
+    assert!(matches!(
+        ExternalJobsClient::with_ca_bundle(&server.address, BEARER, b"invalid CA"),
+        Err(WorkerError::InvalidCaBundle)
+    ));
+    assert!(matches!(
+        within(server.client().claim(&scope())).await,
+        Err(WorkerError::Transport)
+    ));
+    let wrong_root =
+        ExternalJobsClient::with_ca_bundle(&server.address, BEARER, unrelated.pem().as_bytes())
+            .unwrap();
+    assert!(matches!(
+        within(wrong_root.claim(&scope())).await,
+        Err(WorkerError::Transport)
+    ));
+    let bundle = format!("{}{}", unrelated.pem(), ca.pem());
+    let client =
+        ExternalJobsClient::with_ca_bundle(&server.address, BEARER, bundle.as_bytes()).unwrap();
+    let trusted = tokio::spawn(async move { client.claim(&scope()).await });
+    server.next("/claim").await.reply(204, Value::Null);
+    assert!(within(trusted).await.unwrap().unwrap().is_none());
+
+    let wrong_name = Server::listen(Some(acceptor("another-service.invalid", &ca, &ca_key))).await;
+    let client =
+        ExternalJobsClient::with_ca_bundle(&wrong_name.address, BEARER, bundle.as_bytes()).unwrap();
+    assert!(matches!(
+        within(client.claim(&scope())).await,
+        Err(WorkerError::Transport)
+    ));
 }
 
 #[derive(Deserialize)]

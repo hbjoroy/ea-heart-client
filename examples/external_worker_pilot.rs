@@ -111,7 +111,13 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "1".into())
         .parse::<NonZeroUsize>()
         .context("invalid HEART_PILOT_CAPACITY")?;
-    let client = ExternalJobsClient::new(&url, &token)?;
+    let client = match env::var_os("HEART_WORKER_CA_FILE") {
+        Some(path) => {
+            let pem = fs::read(path).context("read HEART_WORKER_CA_FILE")?;
+            ExternalJobsClient::with_ca_bundle(&url, &token, &pem)?
+        }
+        None => ExternalJobsClient::new(&url, &token)?,
+    };
     ExternalDispatcher::new(client, DispatchConfig::default())?
         .register(
             ClaimScope::new(namespace, task_type, 1),

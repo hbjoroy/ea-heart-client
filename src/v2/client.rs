@@ -155,6 +155,10 @@ pub enum WorkerError {
     InvalidEndpoint,
     #[error("invalid Heart worker credentials")]
     InvalidCredentials,
+    #[error("invalid Heart worker CA bundle")]
+    InvalidCaBundle,
+    #[error("the Heart worker client was built without a TLS feature")]
+    TlsUnavailable,
     #[error("failed to initialize the Heart worker HTTP client")]
     ClientInitialization,
     #[error("invalid external job subscription")]
@@ -294,12 +298,32 @@ pub struct ExternalJobsClient {
 impl ExternalJobsClient {
     /// Create a worker client. HTTPS is required except for a loopback HTTP endpoint.
     pub fn new(base_url: &str, bearer_token: &str) -> Result<Self, WorkerError> {
+        Self::build(base_url, bearer_token, None)
+    }
+
+    /// Create an HTTPS worker client that trusts the supplied PEM CA certificates.
+    ///
+    /// The bundle supplies the trusted roots for this client. TLS still verifies
+    /// the server certificate and that its identity matches the endpoint.
+    pub fn with_ca_bundle(
+        base_url: &str,
+        bearer_token: &str,
+        pem: &[u8],
+    ) -> Result<Self, WorkerError> {
+        Self::build(base_url, bearer_token, Some(pem))
+    }
+
+    fn build(
+        base_url: &str,
+        bearer_token: &str,
+        ca_bundle: Option<&[u8]>,
+    ) -> Result<Self, WorkerError> {
         let url = Url::parse(base_url).map_err(|_| WorkerError::InvalidEndpoint)?;
         let loopback = url
             .host_str()
             .and_then(|host| host.trim_matches(['[', ']']).parse::<IpAddr>().ok())
             .is_some_and(|ip| ip.is_loopback());
-        if (url.scheme() != "https" && !(url.scheme() == "http" && loopback))
+        if (url.scheme() != "https" && !(url.scheme() == "http" && loopback && ca_bundle.is_none()))
             || url.host_str().is_none()
             || !url.username().is_empty()
             || url.password().is_some()
@@ -322,8 +346,24 @@ impl ExternalJobsClient {
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .timeout(REQUEST_TIMEOUT);
-        if url.scheme() == "http" {
+        if loopback {
             builder = builder.no_proxy();
+        }
+        #[cfg(not(any(feature = "rustls", feature = "native-tls")))]
+        if url.scheme() == "https" {
+            return Err(WorkerError::TlsUnavailable);
+        }
+        #[cfg(any(feature = "rustls", feature = "native-tls"))]
+        if let Some(pem) = ca_bundle {
+            let roots = reqwest::Certificate::from_pem_bundle(pem)
+                .map_err(|_| WorkerError::InvalidCaBundle)?;
+            if roots.is_empty() {
+                return Err(WorkerError::InvalidCaBundle);
+            }
+            builder = builder.tls_built_in_root_certs(false);
+            for root in roots {
+                builder = builder.add_root_certificate(root);
+            }
         }
         let http = builder
             .build()
