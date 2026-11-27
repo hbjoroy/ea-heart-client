@@ -14,7 +14,7 @@ native-tls = ["reqwest/native-tls"]
 [dependencies]
 reqwest = { version = "0.12.28", default-features = false, features = ["json"] }
 # Preserve patched TLS versions in downstream Cargo resolutions as well as this lockfile.
-rustls = { version = "0.23.46", default-features = false, optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"], optional = true }
 rustls-webpki = { version = "0.103.16", default-features = false, optional = true }
 webpki-roots = { version = "1.0.10", optional = true }
 serde = { version = "1", features = ["derive"] }

@@ -82,6 +82,29 @@ Both TLS backends verify the certificate and endpoint identity. A custom
 bundle supplies the client's trusted roots. It can contain both roots during
 a CA rotation.
 
+### Mutual TLS
+
+When Heart's worker listener requires client certificates, authenticate with a
+certificate instead of a token. Heart maps the certificate's SPIFFE ID (URI SAN,
+for example `spiffe://example.org/ns/payments/sa/account-worker`) to the worker
+principal, so nothing secret is shared.
+
+```rust
+use heart_client::v2::{ClientIdentity, ExternalJobsClient};
+
+let client = ExternalJobsClient::with_client_identity(
+    "https://heart-worker.payments.svc:3001",
+    &std::fs::read("/etc/heart-worker/ca.crt")?,
+    ClientIdentity::from_files("/etc/heart-worker/tls.crt", "/etc/heart-worker/tls.key"),
+)?;
+```
+
+`ClientIdentity::from_files` re-reads the files at most every 30 seconds during
+TLS handshakes, so renewed certificates (for example from cert-manager) are used
+for new connections without a restart. A certificate whose key does not match
+is skipped until the pair is consistent. Mutual TLS requires the `rustls`
+feature and an HTTPS endpoint.
+
 ```rust
 use heart_client::v2::{
     ClaimScope, DispatchConfig, ExternalDispatcher, ExternalHandler, ExternalJobsClient,

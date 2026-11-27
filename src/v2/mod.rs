@@ -2,6 +2,8 @@
 
 mod client;
 mod dispatcher;
+#[cfg(feature = "rustls")]
+mod identity;
 
 pub use client::{
     ClaimScope, Completion, ExternalJobsClient, Failure, FailureKind, JobGrant, JobState,
@@ -11,3 +13,5 @@ pub use dispatcher::{
     DispatchConfig, DispatchError, ExternalDispatcher, ExternalHandler, HandlerFailure, JobContext,
     LeaseLoss, LeaseLossReason,
 };
+#[cfg(feature = "rustls")]
+pub use identity::ClientIdentity;
