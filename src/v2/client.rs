@@ -9,6 +9,8 @@ use uuid::Uuid;
 
 const RESPONSE_LIMIT: usize = 512 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest wait Heart accepts for a long-polling claim.
+pub const MAX_CLAIM_WAIT: Duration = Duration::from_secs(25);
 const JOBS_PATH: &str = "/api/v2/external-jobs";
 
 pub type JsonObject = Map<String, Value>;
@@ -471,10 +473,28 @@ impl ExternalJobsClient {
 
     /// Request one job for an exact namespace, type and version.
     pub async fn claim(&self, scope: &ClaimScope) -> Result<Option<JobGrant>, WorkerError> {
+        self.claim_waiting(scope, Duration::ZERO).await
+    }
+
+    /// Request one job, letting Heart hold the request for up to `wait`
+    /// (at most 25 s) until a matching job is queued. Heart versions without
+    /// long polling answer at once, as for [`Self::claim`].
+    pub async fn claim_waiting(
+        &self,
+        scope: &ClaimScope,
+        wait: Duration,
+    ) -> Result<Option<JobGrant>, WorkerError> {
         if !scope.is_valid() {
             return Err(WorkerError::InvalidScope);
         }
-        let response = self.post("/claim", None, scope).await?;
+        let wait = wait.min(MAX_CLAIM_WAIT);
+        let response = if wait.is_zero() {
+            self.post("/claim", None, scope).await?
+        } else {
+            let path = format!("/claim?wait_ms={}", wait.as_millis());
+            self.post_with_timeout(&path, None, scope, REQUEST_TIMEOUT + wait)
+                .await?
+        };
         if response.status() == StatusCode::NO_CONTENT {
             return Ok(None);
         }
@@ -549,9 +569,21 @@ impl ExternalJobsClient {
         key: Option<&HeaderValue>,
         body: &impl Serialize,
     ) -> Result<Response, WorkerError> {
+        self.post_with_timeout(path, key, body, REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn post_with_timeout(
+        &self,
+        path: &str,
+        key: Option<&HeaderValue>,
+        body: &impl Serialize,
+        request_timeout: Duration,
+    ) -> Result<Response, WorkerError> {
         let mut request = self
             .http
-            .post(format!("{}{JOBS_PATH}{path}", self.base_url));
+            .post(format!("{}{JOBS_PATH}{path}", self.base_url))
+            .timeout(request_timeout);
         if let Some(authorization) = &self.authorization {
             request = request.header(AUTHORIZATION, authorization.clone());
         }

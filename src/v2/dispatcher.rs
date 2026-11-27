@@ -6,7 +6,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::{future::Future, num::NonZeroUsize, sync::Arc, time::Duration};
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{mpsc, watch, Notify},
     task::{JoinError, JoinSet},
     time::{sleep_until, timeout, timeout_at, Instant},
 };
@@ -17,6 +17,9 @@ use uuid::Uuid;
 pub struct DispatchConfig {
     pub poll_min: Duration,
     pub poll_max: Duration,
+    /// How long each claim may wait server-side for a job (long polling).
+    /// A job is then handed out as soon as it is queued. `ZERO` disables it.
+    pub long_poll: Duration,
     /// Maximum elapsed time for one completion or failure, including exact replays.
     pub command_retry_window: Duration,
     /// Active attempts can still renew and report while the dispatcher drains.
@@ -30,6 +33,7 @@ impl Default for DispatchConfig {
         Self {
             poll_min: Duration::from_millis(200),
             poll_max: Duration::from_secs(5),
+            long_poll: Duration::from_secs(20),
             command_retry_window: Duration::from_secs(30),
             shutdown_grace: Duration::from_secs(30),
             lease_loss_grace: Duration::from_millis(250),
@@ -182,6 +186,7 @@ impl ExternalDispatcher {
         if config.poll_min.is_zero()
             || config.poll_max < config.poll_min
             || config.command_retry_window.is_zero()
+            || config.long_poll > super::client::MAX_CLAIM_WAIT
             || [
                 config.poll_max,
                 config.command_retry_window,
@@ -228,6 +233,9 @@ impl ExternalDispatcher {
         let (stop, signal) = watch::channel(false);
         let (failures, mut failure) = mpsc::channel(1);
         let mut tasks = JoinSet::new();
+        // Finishing a job usually queues the process's next step, often for
+        // another subscription: wake them all to poll at once.
+        let activity = Arc::new(Notify::new());
         for subscription in self.subscriptions {
             tasks.spawn(poll_subscription(
                 self.client.clone(),
@@ -235,6 +243,7 @@ impl ExternalDispatcher {
                 subscription,
                 signal.clone(),
                 failures.clone(),
+                activity.clone(),
             ));
         }
         let outcome = tokio::select! {
@@ -263,6 +272,7 @@ async fn poll_subscription(
     subscription: Subscription,
     mut shutdown: watch::Receiver<bool>,
     failure: mpsc::Sender<WorkerError>,
+    activity: Arc<Notify>,
 ) {
     let mut jobs = JoinSet::new();
     let mut backoff = Backoff::new(config.poll_min, config.poll_max);
@@ -272,12 +282,19 @@ async fn poll_subscription(
             biased;
             _ = shutdown.changed() => break,
             joined = jobs.join_next(), if !jobs.is_empty() => log_task_failure(joined),
+            // Another subscription finished a job: poll now and fast.
+            _ = activity.notified() => {
+                backoff.reset();
+                next_poll = Instant::now();
+            }
             _ = sleep_until(next_poll), if jobs.len() < subscription.capacity.get() => {
                 let requested_at = Instant::now();
+                // An in-flight claim is never abandoned for activity: Heart may
+                // already have leased a job to it.
                 let response = tokio::select! {
                     biased;
                     _ = shutdown.changed() => break,
-                    response = client.claim(&subscription.scope) => response,
+                    response = client.claim_waiting(&subscription.scope, config.long_poll) => response,
                 };
                 match response {
                     Ok(Some(grant)) => {
@@ -286,8 +303,16 @@ async fn poll_subscription(
                         }
                         backoff.reset();
                         next_poll = Instant::now();
-                        jobs.spawn(run_job(client.clone(), config, subscription.handler.clone(), grant, requested_at));
+                        jobs.spawn(run_job(client.clone(), config, subscription.handler.clone(), grant, requested_at, activity.clone()));
                     }
+                    // Heart waited for us and nothing came: ask again right away.
+                    Ok(None) if !config.long_poll.is_zero()
+                        && requested_at.elapsed() >= config.long_poll / 2 =>
+                    {
+                        backoff.reset();
+                        next_poll = Instant::now();
+                    }
+                    // Empty answer at once (no long polling on this Heart): back off.
                     Ok(None) => next_poll = after(backoff.next(None)),
                     Err(error) if error.should_retry() => {
                         next_poll = after(backoff.next(error.retry_after()));
@@ -313,6 +338,18 @@ fn log_task_failure(joined: Option<Result<(), JoinError>>) {
 }
 
 async fn run_job(
+    client: ExternalJobsClient,
+    config: DispatchConfig,
+    handler: Arc<dyn ErasedHandler>,
+    grant: JobGrant,
+    requested_at: Instant,
+    activity: Arc<Notify>,
+) {
+    run_attempt(client, config, handler, grant, requested_at).await;
+    activity.notify_waiters();
+}
+
+async fn run_attempt(
     client: ExternalJobsClient,
     config: DispatchConfig,
     handler: Arc<dyn ErasedHandler>,

@@ -40,7 +40,12 @@ impl Request {
     }
 
     fn assert_path(&self, path: &str) {
-        assert_eq!(self.line, format!("POST {BASE}{path} HTTP/1.1"));
+        // Claims may carry ?wait_ms= (long polling); compare the path only.
+        let line = match self.line.split_once('?') {
+            Some((before, after)) => format!("{before} {}", after.split_once(' ').unwrap().1),
+            None => self.line.clone(),
+        };
+        assert_eq!(line, format!("POST {BASE}{path} HTTP/1.1"));
         assert_eq!(self.headers["authorization"], format!("Bearer {BEARER}"));
         assert_eq!(self.headers["content-type"], "application/json");
     }
@@ -580,6 +585,137 @@ async fn mutual_tls_presents_the_client_certificate_instead_of_a_token() {
     assert!(!request.headers.contains_key("authorization"));
     request.reply(204, Value::Null);
     assert!(within(claim).await.unwrap().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn dispatcher_reclaims_at_once_after_a_server_side_wait() {
+    let mut server = Server::start().await;
+    let config = DispatchConfig {
+        // Without long polling the next claim would wait at least 0.5 s.
+        poll_min: Duration::from_secs(1),
+        poll_max: Duration::from_secs(5),
+        long_poll: Duration::from_millis(400),
+        shutdown_grace: Duration::from_millis(200),
+        ..DispatchConfig::default()
+    };
+    let (ready, _started) = mpsc::channel(1);
+    let dispatcher = ExternalDispatcher::new(server.client(), config)
+        .unwrap()
+        .register(
+            scope(),
+            NonZeroUsize::MIN,
+            Handler {
+                ready,
+                mode: Mode::Immediate,
+            },
+        )
+        .unwrap();
+    let (stop, stopping) = oneshot::channel::<()>();
+    let running = tokio::spawn(dispatcher.run(async move {
+        let _ = stopping.await;
+    }));
+
+    let first = server.next("/claim").await;
+    assert!(first.line.contains("?wait_ms=400 "), "{}", first.line);
+    // Heart held the claim, then found nothing.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let answered = std::time::Instant::now();
+    first.reply(204, Value::Null);
+    let second = within(server.requests.recv()).await.unwrap();
+    second.assert_path("/claim");
+    assert!(
+        answered.elapsed() < Duration::from_millis(150),
+        "next claim after {:?}",
+        answered.elapsed()
+    );
+    second.reply(204, Value::Null);
+    stop.send(()).unwrap();
+    within(running).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn finishing_a_job_wakes_idle_subscriptions_to_poll_at_once() {
+    let mut server = Server::start().await;
+    let config = DispatchConfig {
+        poll_min: Duration::from_secs(1),
+        poll_max: Duration::from_secs(5),
+        long_poll: Duration::ZERO,
+        shutdown_grace: Duration::from_millis(200),
+        ..DispatchConfig::default()
+    };
+    let other = ClaimScope::new("payments", "next-step", 1);
+    let (ready, mut started) = mpsc::channel(4);
+    let dispatcher = ExternalDispatcher::new(server.client(), config)
+        .unwrap()
+        .register(
+            scope(),
+            NonZeroUsize::MIN,
+            Handler {
+                ready: ready.clone(),
+                mode: Mode::Immediate,
+            },
+        )
+        .unwrap()
+        .register(
+            other.clone(),
+            NonZeroUsize::MIN,
+            Handler {
+                ready,
+                mode: Mode::Immediate,
+            },
+        )
+        .unwrap();
+    let (stop, stopping) = oneshot::channel::<()>();
+    let running = tokio::spawn(dispatcher.run(async move {
+        let _ = stopping.await;
+    }));
+    let job = Uuid::new_v4();
+    let lease = Uuid::new_v4();
+
+    // The next-step queue is empty and starts backing off before the
+    // account-check job is handed out; then finishing that job must wake it.
+    let mut held_grant = None;
+    let mut next_step_idle = false;
+    let mut granted = false;
+    let mut finished = None;
+    loop {
+        let request = within(server.requests.recv()).await.unwrap();
+        if request.line.contains("/complete") {
+            let key = request.headers["idempotency-key"].clone();
+            finished = Some(std::time::Instant::now());
+            request.reply(200, receipt(job, &key, "completed", "completed"));
+            continue;
+        }
+        request.assert_path("/claim");
+        if request.body()["task_type"] == "next-step" {
+            if let Some(finished) = finished {
+                assert!(
+                    finished.elapsed() < Duration::from_millis(300),
+                    "woken after {:?}",
+                    finished.elapsed()
+                );
+                request.reply(204, Value::Null);
+                break;
+            }
+            request.reply(204, Value::Null);
+            next_step_idle = true;
+            if let Some(claim) = held_grant.take() {
+                let claim: Request = claim;
+                claim.reply(200, grant(job, lease, 5000, 2000));
+                granted = true;
+            }
+        } else if !granted && next_step_idle {
+            request.reply(200, grant(job, lease, 5000, 2000));
+            granted = true;
+        } else if !granted {
+            held_grant = Some(request);
+        } else {
+            request.reply(204, Value::Null);
+        }
+    }
+    assert_eq!(within(started.recv()).await, Some(job));
+    stop.send(()).unwrap();
+    within(running).await.unwrap().unwrap();
 }
 
 #[derive(Deserialize)]
