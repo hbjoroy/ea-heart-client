@@ -337,6 +337,9 @@ fn mutual_tls_config(
         .with_root_certificates(roots)
         .with_client_cert_resolver(resolver);
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // A resumed session would not send the (possibly renewed) client
+    // certificate; always perform a full handshake.
+    config.resumption = rustls::client::Resumption::disabled();
     Ok(config)
 }
 
