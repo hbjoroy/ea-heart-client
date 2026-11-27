@@ -455,6 +455,133 @@ async fn https_private_ca_requires_a_trusted_root_and_the_correct_endpoint_ident
     ));
 }
 
+#[tokio::test]
+async fn mutual_tls_presents_the_client_certificate_instead_of_a_token() {
+    use heart_client::v2::ClientIdentity;
+    use rcgen::{
+        BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
+        KeyPair, KeyUsagePurpose, SanType,
+    };
+    use tokio_rustls::rustls::{
+        self,
+        pki_types::{pem::PemObject, PrivatePkcs8KeyDer},
+        server::WebPkiClientVerifier,
+        RootCertStore, ServerConfig,
+    };
+
+    fn authority(name: &str) -> (Certificate, KeyPair) {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name.push(DnType::CommonName, name);
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        (params.self_signed(&key).unwrap(), key)
+    }
+
+    fn leaf(ca: &Certificate, ca_key: &KeyPair, client: bool) -> (String, String) {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(if client {
+            vec![]
+        } else {
+            vec!["127.0.0.1".to_owned()]
+        })
+        .unwrap();
+        if client {
+            params.subject_alt_names.push(SanType::URI(
+                "spiffe://bjoroy.me/ns/payments/sa/account-worker"
+                    .try_into()
+                    .unwrap(),
+            ));
+        }
+        params.extended_key_usages = vec![if client {
+            ExtendedKeyUsagePurpose::ClientAuth
+        } else {
+            ExtendedKeyUsagePurpose::ServerAuth
+        }];
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let cert = params.signed_by(&key, ca, ca_key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+
+    let (ca, ca_key) = authority("Heart worker CA");
+    let (foreign_ca, foreign_key) = authority("Unrelated CA");
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut client_roots = RootCertStore::empty();
+    client_roots.add(ca.der().clone()).unwrap();
+    let (server_cert, server_key) = leaf(&ca, &ca_key, false);
+    let server_key = KeyPair::from_pem(&server_key).unwrap();
+    let config = ServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_client_cert_verifier(
+            WebPkiClientVerifier::builder_with_provider(Arc::new(client_roots), provider)
+                .build()
+                .unwrap(),
+        )
+        .with_single_cert(
+            vec![
+                rustls::pki_types::CertificateDer::from_pem_slice(server_cert.as_bytes()).unwrap(),
+            ],
+            PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
+        )
+        .unwrap();
+    let mut server = Server::listen(Some(Arc::new(config).into())).await;
+    let bundle = ca.pem();
+
+    // Input validation.
+    let (cert, key) = leaf(&ca, &ca_key, true);
+    let (_, other_key) = leaf(&ca, &ca_key, true);
+    assert!(matches!(
+        ExternalJobsClient::with_client_identity(
+            &server.address,
+            bundle.as_bytes(),
+            ClientIdentity::from_pem(cert.as_bytes(), other_key.as_bytes()),
+        ),
+        Err(WorkerError::InvalidClientIdentity)
+    ));
+    assert!(matches!(
+        ExternalJobsClient::with_client_identity(
+            "http://127.0.0.1:1",
+            bundle.as_bytes(),
+            ClientIdentity::from_pem(cert.as_bytes(), key.as_bytes()),
+        ),
+        Err(WorkerError::InvalidEndpoint)
+    ));
+
+    // A token alone, or a certificate from another CA, is refused in the handshake.
+    let token_only =
+        ExternalJobsClient::with_ca_bundle(&server.address, BEARER, bundle.as_bytes()).unwrap();
+    assert!(matches!(
+        within(token_only.claim(&scope())).await,
+        Err(WorkerError::Transport)
+    ));
+    let (foreign_cert, foreign_cert_key) = leaf(&foreign_ca, &foreign_key, true);
+    let foreign = ExternalJobsClient::with_client_identity(
+        &server.address,
+        bundle.as_bytes(),
+        ClientIdentity::from_pem(foreign_cert.as_bytes(), foreign_cert_key.as_bytes()),
+    )
+    .unwrap();
+    assert!(matches!(
+        within(foreign.claim(&scope())).await,
+        Err(WorkerError::Transport)
+    ));
+
+    // Trusted client certificate: the request goes through without a token.
+    let client = ExternalJobsClient::with_client_identity(
+        &server.address,
+        bundle.as_bytes(),
+        ClientIdentity::from_pem(cert.as_bytes(), key.as_bytes()),
+    )
+    .unwrap();
+    let claim = tokio::spawn(async move { client.claim(&scope()).await });
+    let request = within(server.requests.recv()).await.unwrap();
+    assert_eq!(request.line, format!("POST {BASE}/claim HTTP/1.1"));
+    assert!(!request.headers.contains_key("authorization"));
+    request.reply(204, Value::Null);
+    assert!(within(claim).await.unwrap().unwrap().is_none());
+}
+
 #[derive(Deserialize)]
 struct Input {
     account_id: String,
