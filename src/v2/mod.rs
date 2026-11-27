@@ -8,6 +8,7 @@ mod identity;
 pub use client::{
     ClaimScope, Completion, ExternalJobsClient, Failure, FailureKind, JobGrant, JobState,
     JsonObject, LeaseTiming, LeaseToken, Outcome, Receipt, WorkerError, WorkerErrorCode,
+    MAX_CLAIM_WAIT,
 };
 pub use dispatcher::{
     DispatchConfig, DispatchError, ExternalDispatcher, ExternalHandler, HandlerFailure, JobContext,
